@@ -1,6 +1,7 @@
 import re
 import time
 import logging
+import threading
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -64,6 +65,27 @@ _RHINE_DEM_TILES = [
 ]
 
 
+# How long to wait between background retry passes for whatever's still
+# missing after the initial (blocking) attempt at startup. These sources are
+# flaky (rate-limiting, transient 503s), so retries continue indefinitely
+# until everything is downloaded — a daemon thread just sleeps in between.
+_RETRY_INTERVAL_S = 300
+
+
+def _retry_forever(label: str, attempt) -> None:
+    """Call attempt() every _RETRY_INTERVAL_S until it reports nothing missing."""
+    def loop():
+        while True:
+            time.sleep(_RETRY_INTERVAL_S)
+            missing = attempt()
+            if not missing:
+                logger.info("[%s] background retry: all tiles now present.", label)
+                return
+            logger.info("[%s] background retry: %d tile(s) still missing, trying again in %ds.",
+                        label, len(missing), _RETRY_INTERVAL_S)
+    threading.Thread(target=loop, name=f"{label}-retry", daemon=True).start()
+
+
 def _needed_tile_names(base_url: str) -> list[str]:
     """Names of tiles within DTM_TILE_BOUNDS, per the source's index.json."""
     x0, x1, y0, y1 = DTM_TILE_BOUNDS
@@ -100,67 +122,101 @@ def _download_one(base_url: str, dest_dir: Path, name: str, retries: int = 6) ->
         return
 
 
-def ensure_tiles(base_url: str, dest_dir: Path, label: str) -> None:
-    """Download any corridor tiles missing from dest_dir. No-op if all present."""
+def ensure_tiles(base_url: str, dest_dir: Path, label: str, on_downloaded=None) -> list[str] | None:
+    """Download any corridor tiles missing from dest_dir.
+
+    Calls on_downloaded(path) for each tile newly written to disk. Returns the
+    list of tile names still missing afterwards (empty if none), or None if
+    the tile index itself couldn't be reached at all (caller should retry).
+    """
     dest_dir.mkdir(parents=True, exist_ok=True)
     try:
         names = _needed_tile_names(base_url)
     except Exception as exc:
         logger.warning("[%s] could not reach tile index (%s); using tiles already on disk.", label, exc)
-        return
+        return None
 
     missing = [n for n in names if not (dest_dir / n).exists()]
     if not missing:
         logger.info("[%s] %d corridor tiles present, none missing.", label, len(names))
-        return
+        return []
 
     logger.info("[%s] downloading %d of %d needed tiles…", label, len(missing), len(names))
-    failed = 0
+    still_missing = []
     with ThreadPoolExecutor(max_workers=4) as pool:
         futures = {pool.submit(_download_one, base_url, dest_dir, n): n for n in missing}
         for i, fut in enumerate(as_completed(futures), 1):
+            name = futures[fut]
             try:
                 fut.result()
             except Exception as exc:
-                failed += 1
-                logger.warning("[%s] failed to download %s: %s", label, futures[fut], exc)
+                still_missing.append(name)
+                logger.warning("[%s] failed to download %s: %s", label, name, exc)
+            else:
+                if on_downloaded:
+                    on_downloaded(dest_dir / name)
             if i % 50 == 0 or i == len(missing):
                 logger.info("[%s] %d/%d", label, i, len(missing))
-    if failed:
-        logger.warning("[%s] %d tile(s) failed; will retry on next restart.", label, failed)
+    if still_missing:
+        logger.warning("[%s] %d tile(s) failed; will keep retrying in the background.", label, len(still_missing))
     logger.info("[%s] done.", label)
+    return still_missing
 
 
-def ensure_dtm_dsm(dtm_dir: Path, dsm_dir: Path) -> None:
-    ensure_tiles(_DTM_URL, dtm_dir, "DTM")
-    ensure_tiles(_DSM_URL, dsm_dir, "DSM")
+def ensure_dtm_dsm(dtm_dir: Path, dsm_dir: Path, on_dtm_tile=None, on_dsm_tile=None) -> None:
+    missing_dtm = ensure_tiles(_DTM_URL, dtm_dir, "DTM", on_downloaded=on_dtm_tile)
+    if missing_dtm is None or missing_dtm:
+        _retry_forever("DTM", lambda: ensure_tiles(_DTM_URL, dtm_dir, "DTM", on_downloaded=on_dtm_tile))
+
+    missing_dsm = ensure_tiles(_DSM_URL, dsm_dir, "DSM", on_downloaded=on_dsm_tile)
+    if missing_dsm is None or missing_dsm:
+        _retry_forever("DSM", lambda: ensure_tiles(_DSM_URL, dsm_dir, "DSM", on_downloaded=on_dsm_tile))
 
 
-def ensure_rhine_dem(dest_dir: Path) -> None:
-    """Download any BfG Rhine DEM tiles overlapping DTM_TILE_BOUNDS that are missing."""
+def _rhine_dem_needed(dest_dir: Path) -> list[str]:
     x0, x1, y0, y1 = (v * 1000 for v in DTM_TILE_BOUNDS)
     needed = [
         name for name, e0, e1, n0, n1 in _RHINE_DEM_TILES
         if e0 < x1 and e1 > x0 and n0 < y1 and n1 > y0
     ]
+    return [n for n in needed if not (dest_dir / f"{n}.tif").exists()]
+
+
+def _ensure_rhine_dem_once(dest_dir: Path, on_downloaded=None) -> list[str]:
+    """One pass: download whatever Rhine DEM tiles are still missing. Returns
+    the list of tile names still missing afterwards."""
+    missing = _rhine_dem_needed(dest_dir)
+    if not missing:
+        logger.info("[Rhine DEM] all corridor tiles present.")
+        return []
 
     dest_dir.mkdir(parents=True, exist_ok=True)
-    missing = [n for n in needed if not (dest_dir / f"{n}.tif").exists()]
-    if not missing:
-        logger.info("[Rhine DEM] %d corridor tiles present, none missing.", len(needed))
-        return
-
-    logger.info("[Rhine DEM] downloading %d of %d needed tiles…", len(missing), len(needed))
-    try:
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            futures = [
-                pool.submit(_download_one, _RHINE_DEM_BASE, dest_dir, f"{n}.tif")
-                for n in missing
-            ]
-            for i, fut in enumerate(futures, 1):
+    logger.info("[Rhine DEM] downloading %d needed tile(s)…", len(missing))
+    still_missing = []
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        futures = {
+            pool.submit(_download_one, _RHINE_DEM_BASE, dest_dir, f"{n}.tif"): n
+            for n in missing
+        }
+        for i, fut in enumerate(as_completed(futures), 1):
+            name = futures[fut]
+            try:
                 fut.result()
-                logger.info("[Rhine DEM] %d/%d", i, len(missing))
-    except Exception as exc:
-        logger.warning("[Rhine DEM] download failed (%s); continuing with tiles already on disk.", exc)
-        return
+            except Exception as exc:
+                still_missing.append(name)
+                logger.warning("[Rhine DEM] failed to download %s: %s", name, exc)
+            else:
+                if on_downloaded:
+                    on_downloaded(dest_dir / f"{name}.tif")
+            logger.info("[Rhine DEM] %d/%d", i, len(missing))
+    if still_missing:
+        logger.warning("[Rhine DEM] %d tile(s) failed; will keep retrying in the background.", len(still_missing))
     logger.info("[Rhine DEM] done.")
+    return still_missing
+
+
+def ensure_rhine_dem(dest_dir: Path, on_tile=None) -> None:
+    """Download any BfG Rhine DEM tiles overlapping DTM_TILE_BOUNDS that are missing."""
+    missing = _ensure_rhine_dem_once(dest_dir, on_downloaded=on_tile)
+    if missing:
+        _retry_forever("Rhine DEM", lambda: _ensure_rhine_dem_once(dest_dir, on_downloaded=on_tile))
