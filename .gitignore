@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Terrain data — auto-downloaded by terrain_download.py, ~65 GB, never commit
+data/
+
+
+# Tooling / IDE state
+.idea/
+.claude/
+.playwright-mcp/
+CLAUDE.md

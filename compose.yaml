@@ -1,0 +1,10 @@
+services:
+  fishingmap:
+    image: ghcr.io/m1ndgames/fishingmap:latest
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - FLASK_DEBUG=0
+      - LOG_LEVEL=INFO

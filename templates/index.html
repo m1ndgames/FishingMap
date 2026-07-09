@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FishingMap</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/maplibre-gl@4.7.1/dist/maplibre-gl.css"/>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; height: 100vh; overflow: hidden; }
+    #map { position: absolute; inset: 0; }
+
+    #controls {
+      position: absolute; top: 8px; left: 8px; z-index: 1;
+      display: flex; gap: 4px;
+    }
+    .ctrl-btn {
+      padding: 6px 12px; font-size: .78rem; border-radius: 4px; cursor: pointer;
+      border: 1px solid #334155; background: rgba(30,41,59,.85); color: #94a3b8;
+      transition: all .15s;
+    }
+    .ctrl-btn.active { background: #0369a1; border-color: #38bdf8; color: #e0f2fe; }
+  </style>
+</head>
+<body>
+
+<div id="map">
+  <div id="controls">
+    <button id="btn-osm" class="ctrl-btn active">OSM</button>
+    <button id="btn-sat" class="ctrl-btn">Satellite</button>
+    <button id="btn-overlay" class="ctrl-btn active">Overlay</button>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script>
+// ── Constants ──────────────────────────────────────────────────────────────
+const POLL_MS    = 5 * 60 * 1000;
+const DEPTH_MIN  = 15;   // minimum zoom for depth overlay (max is 18, set on the source below)
+
+// ── Map ────────────────────────────────────────────────────────────────────
+const map = new maplibregl.Map({
+  container: 'map',
+  style: {
+    version: 8,
+    sources: {
+      osm: {
+        type: 'raster',
+        tiles: [
+          'https://a.tile.openstreetmap.org/{z}/{x}/{y}.png',
+          'https://b.tile.openstreetmap.org/{z}/{x}/{y}.png',
+          'https://c.tile.openstreetmap.org/{z}/{x}/{y}.png',
+        ],
+        tileSize: 256,
+        maxzoom: 19,
+        attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+      },
+      satellite: {
+        type: 'raster',
+        // ESRI World Imagery — tile URL uses {z}/{y}/{x} row/col order
+        tiles: ['https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'],
+        tileSize: 256,
+        maxzoom: 19,
+        attribution: 'Satellite: Esri, Maxar, Earthstar Geographics',
+      },
+      water: {
+        type: 'raster',
+        tiles: [`${location.origin}/tiles/water/{z}/{x}/{y}.png?v=init`],
+        tileSize: 256,
+        minzoom: DEPTH_MIN,
+        maxzoom: 18,
+        bounds: [6.39, 50.72, 7.12, 51.77],   // Rhine Bonn→Wesel corridor
+        attribution: 'Water extent: DTM © IT.NRW · BfG Rhine DEM',
+      },
+      depth: {
+        type: 'raster',
+        tiles: [`${location.origin}/tiles/depth/{z}/{x}/{y}.png?v=init`],
+        tileSize: 256,
+        minzoom: DEPTH_MIN,
+        maxzoom: 18,
+        bounds: [6.39, 50.72, 7.12, 51.77],
+        attribution: 'Bathymetry: DTM © IT.NRW · BfG Rhine DEM',
+      },
+    },
+    layers: [
+      { id: 'osm-layer',       type: 'raster', source: 'osm' },
+      { id: 'satellite-layer', type: 'raster', source: 'satellite',
+        layout: { visibility: 'none' } },
+      { id: 'water-layer', type: 'raster', source: 'water',
+        minzoom: DEPTH_MIN,
+        layout: { visibility: 'none' },   // water extent overlay disabled by default
+        paint: { 'raster-opacity': 0.75 } },
+      { id: 'depth-layer', type: 'raster', source: 'depth',
+        minzoom: DEPTH_MIN,
+        paint: { 'raster-opacity': 1 } },
+    ],
+  },
+  center: [6.7735, 51.2277],
+  zoom: 13,
+});
+
+map.addControl(new maplibregl.NavigationControl(), 'top-right');
+map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }), 'bottom-left');
+
+// ── Overlay toggle ─────────────────────────────────────────────────────────
+const btnOverlay = document.getElementById('btn-overlay');
+let overlayOn = true;
+btnOverlay.addEventListener('click', () => {
+  overlayOn = !overlayOn;
+  map.setLayoutProperty('depth-layer', 'visibility', overlayOn ? 'visible' : 'none');
+  btnOverlay.classList.toggle('active', overlayOn);
+});
+
+// ── Base layer toggle ──────────────────────────────────────────────────────
+const btnOsm = document.getElementById('btn-osm');
+const btnSat = document.getElementById('btn-sat');
+
+function setBaseLayer(id) {
+  map.setLayoutProperty('osm-layer',       'visibility', id === 'osm' ? 'visible' : 'none');
+  map.setLayoutProperty('satellite-layer', 'visibility', id === 'sat' ? 'visible' : 'none');
+  btnOsm.classList.toggle('active', id === 'osm');
+  btnSat.classList.toggle('active', id === 'sat');
+}
+btnOsm.addEventListener('click', () => setBaseLayer('osm'));
+btnSat.addEventListener('click', () => setBaseLayer('sat'));
+
+// ── Overlay tile refresh ───────────────────────────────────────────────────
+let currentProfileKey = 'init';
+
+function refreshOverlayTiles(profileKey) {
+  currentProfileKey = profileKey;
+  map.getSource('water').setTiles([`${location.origin}/tiles/water/{z}/{x}/{y}.png?v=${profileKey}`]);
+  map.getSource('depth').setTiles([`${location.origin}/tiles/depth/{z}/{x}/{y}.png?v=${profileKey}`]);
+}
+
+// ── PEGELONLINE polling ────────────────────────────────────────────────────
+// No visible gauge display anymore — this just keeps the depth/water tile
+// URLs in sync with the live water level (profile_key changes every ~5 min).
+async function fetchWaterLevel() {
+  let data;
+  try {
+    const r = await fetch('/api/waterlevel');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    data = await r.json();
+  } catch (err) {
+    console.warn('[pegelonline] fetch failed:', err);
+    return;
+  }
+
+  if (data.profile_key !== currentProfileKey) {
+    refreshOverlayTiles(data.profile_key);
+  }
+}
+
+// ── Boot ───────────────────────────────────────────────────────────────────
+map.on('load', () => {
+  fetchWaterLevel();
+  setInterval(fetchWaterLevel, POLL_MS);
+});
+</script>
+</body>
+</html>

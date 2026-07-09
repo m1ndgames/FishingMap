@@ -1,0 +1,10 @@
+.venv
+__pycache__
+*.pyc
+data/
+fishingmap.db
+*.log
+.git
+.idea
+.claude
+.playwright-mcp
