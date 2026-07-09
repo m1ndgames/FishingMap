@@ -2,7 +2,7 @@ import re
 import time
 import logging
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
@@ -81,14 +81,23 @@ def _needed_tile_names(base_url: str) -> list[str]:
 
 
 def _download_one(base_url: str, dest_dir: Path, name: str, retries: int = 6) -> None:
-    resp = requests.get(f"{base_url}/{name}", timeout=60)
-    for attempt in range(retries - 1):
-        if resp.status_code not in (429, 500, 502, 503, 504):
-            break
-        time.sleep(2 ** attempt)
-        resp = requests.get(f"{base_url}/{name}", timeout=60)
-    resp.raise_for_status()
-    (dest_dir / name).write_bytes(resp.content)
+    for attempt in range(retries):
+        last = attempt == retries - 1
+        try:
+            resp = requests.get(f"{base_url}/{name}", timeout=60)
+        except requests.exceptions.RequestException:
+            if last:
+                raise
+            time.sleep(2 ** attempt)
+            continue
+        if resp.status_code in (429, 500, 502, 503, 504):
+            if last:
+                resp.raise_for_status()
+            time.sleep(2 ** attempt)
+            continue
+        resp.raise_for_status()
+        (dest_dir / name).write_bytes(resp.content)
+        return
 
 
 def ensure_tiles(base_url: str, dest_dir: Path, label: str) -> None:
@@ -106,12 +115,19 @@ def ensure_tiles(base_url: str, dest_dir: Path, label: str) -> None:
         return
 
     logger.info("[%s] downloading %d of %d needed tiles…", label, len(missing), len(names))
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = [pool.submit(_download_one, base_url, dest_dir, n) for n in missing]
-        for i, fut in enumerate(futures, 1):
-            fut.result()
+    failed = 0
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {pool.submit(_download_one, base_url, dest_dir, n): n for n in missing}
+        for i, fut in enumerate(as_completed(futures), 1):
+            try:
+                fut.result()
+            except Exception as exc:
+                failed += 1
+                logger.warning("[%s] failed to download %s: %s", label, futures[fut], exc)
             if i % 50 == 0 or i == len(missing):
                 logger.info("[%s] %d/%d", label, i, len(missing))
+    if failed:
+        logger.warning("[%s] %d tile(s) failed; will retry on next restart.", label, failed)
     logger.info("[%s] done.", label)
 
 
