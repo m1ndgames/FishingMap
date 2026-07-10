@@ -20,6 +20,7 @@
       transition: all .15s;
     }
     .ctrl-btn.active { background: #0369a1; border-color: #38bdf8; color: #e0f2fe; }
+    .depth-popup { font-size: .82rem; padding: 2px 2px; }
   </style>
 </head>
 <body>
@@ -102,6 +103,43 @@ const map = new maplibregl.Map({
 map.addControl(new maplibregl.NavigationControl(), 'top-right');
 map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }), 'bottom-left');
 
+// ── Geolocation ────────────────────────────────────────────────────────────
+const geolocate = new maplibregl.GeolocateControl({
+  positionOptions: { enableHighAccuracy: true },
+  trackUserLocation: true,
+  showUserLocation: true,
+});
+map.addControl(geolocate, 'top-right');
+geolocate.on('error', (e) => console.warn('[geolocate]', e && e.message ? e.message : e));
+
+// ── Click-to-query depth ──────────────────────────────────────────────────
+const depthPopup = new maplibregl.Popup({ closeButton: true, maxWidth: '220px' });
+let depthRequestId = 0;
+
+map.on('click', async (e) => {
+  const requestId = ++depthRequestId;
+  const { lng, lat } = e.lngLat;
+
+  let data;
+  try {
+    const r = await fetch(`/api/depth?lat=${lat}&lon=${lng}`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    data = await r.json();
+  } catch (err) {
+    console.warn('[depth] fetch failed:', err);
+    return;
+  }
+
+  if (requestId !== depthRequestId) return;   // a newer click superseded this one
+  if (!data.underwater) {
+    depthPopup.remove();
+    return;
+  }
+  depthPopup.setLngLat(e.lngLat)
+    .setHTML(`<div class="depth-popup">Water depth: ${data.depth_m.toFixed(1)} m</div>`)
+    .addTo(map);
+});
+
 // ── Overlay toggle ─────────────────────────────────────────────────────────
 const btnOverlay = document.getElementById('btn-overlay');
 let overlayOn = true;
@@ -156,6 +194,7 @@ async function fetchWaterLevel() {
 map.on('load', () => {
   fetchWaterLevel();
   setInterval(fetchWaterLevel, POLL_MS);
+  geolocate.trigger();
 });
 </script>
 </body>

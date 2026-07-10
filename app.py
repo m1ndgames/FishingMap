@@ -8,7 +8,7 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 
-from flask import Flask, jsonify, render_template, abort, Response
+from flask import Flask, jsonify, render_template, abort, Response, request
 import tiles
 import pegelonline
 
@@ -26,6 +26,20 @@ def index():
 @app.get("/api/waterlevel")
 def api_waterlevel():
     return jsonify(pegelonline.get_water_level())
+
+
+@app.get("/api/depth")
+def api_depth():
+    lat = request.args.get("lat", type=float)
+    lon = request.args.get("lon", type=float)
+    if lat is None or lon is None or not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+        abort(400)
+
+    wl = pegelonline.get_water_level()
+    depth = tiles.get_depth_at_point(lat, lon, wl["profile"])
+    if depth is None:
+        return jsonify({"depth_m": None, "underwater": False})
+    return jsonify({"depth_m": round(depth, 2), "underwater": depth > 0})
 
 
 # ── Depth raster tiles ────────────────────────────────────────────────────────

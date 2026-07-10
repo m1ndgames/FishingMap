@@ -91,6 +91,12 @@ def _reproject_into(path, dst_transform, dst_nodata=np.nan) -> np.ndarray:
     return tmp
 
 
+def _tile_transform(z, x, y):
+    """Affine transform mapping pixel (col, row) -> web-mercator (x, y) for tile z/x/y."""
+    xy = mercantile.xy_bounds(x, y, z)
+    return from_bounds(xy.left, xy.bottom, xy.right, xy.top, TILE_SIZE, TILE_SIZE)
+
+
 def _read_dtm_grid(z, x, y) -> np.ndarray | None:
     """Return a 256×256 float32 elevation grid (NaN = no data).
 
@@ -98,8 +104,7 @@ def _read_dtm_grid(z, x, y) -> np.ndarray | None:
     (includes echo-sounded channel bathymetry). Where both overlap the
     Rhine DEM wins via np.minimum so the deeper channel floor is used.
     """
-    xy  = mercantile.xy_bounds(x, y, z)
-    dst_transform = from_bounds(xy.left, xy.bottom, xy.right, xy.top, TILE_SIZE, TILE_SIZE)
+    dst_transform = _tile_transform(z, x, y)
 
     wgs = mercantile.bounds(x, y, z)
     w, s = _to_utm.transform(wgs.west, wgs.south)
@@ -139,6 +144,36 @@ def _read_dtm_grid(z, x, y) -> np.ndarray | None:
         dst[only_rhine] = tmp[only_rhine]
 
     return dst if not np.all(np.isnan(dst)) else None
+
+
+def get_depth_at_point(lat: float, lon: float, profile: list, z: int = 18) -> float | None:
+    """Return water depth in metres at (lat, lon), or None if no elevation
+    data covers the point (outside DTM/Rhine-DEM coverage).
+
+    Uses the same z=18 grid _read_dtm_grid builds for the maxzoom depth
+    tile, so a click matches what's drawn on screen. Result may be <= 0
+    (point is on land / above water surface) — callers treat depth > 0
+    as "underwater".
+    """
+    tile = mercantile.tile(lon, lat, z)
+    grid = _read_dtm_grid(z, tile.x, tile.y)
+    if grid is None:
+        return None
+
+    dst_transform = _tile_transform(z, tile.x, tile.y)
+    mx, my = mercantile.xy(lon, lat)
+    col, row = ~dst_transform * (mx, my)
+    col = int(np.clip(col, 0, TILE_SIZE - 1))
+    row = int(np.clip(row, 0, TILE_SIZE - 1))
+
+    elevation = float(grid[row, col])
+    if np.isnan(elevation):
+        return None
+
+    lats_ctrl = np.array([p[0] for p in profile], dtype=np.float64)
+    ws_ctrl   = np.array([p[1] for p in profile], dtype=np.float64)
+    ws = float(np.interp(lat, lats_ctrl, ws_ctrl))
+    return ws - elevation
 
 
 def get_water_tile(z: int, x: int, y: int, profile: list) -> bytes | None:
