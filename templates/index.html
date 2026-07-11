@@ -21,6 +21,20 @@
     }
     .ctrl-btn.active { background: #0369a1; border-color: #38bdf8; color: #e0f2fe; }
     .depth-popup { font-size: .82rem; padding: 2px 2px; }
+
+    #btn-compass { position: relative; }
+    .compass-arrow {
+      display: inline-block;
+      width: 0; height: 0;
+      margin-left: 5px;
+      border-left: 4px solid transparent;
+      border-right: 4px solid transparent;
+      border-bottom: 7px solid currentColor;
+      transform-origin: 50% 70%;
+      transform: rotate(0deg);
+      transition: transform .1s linear;
+      vertical-align: middle;
+    }
   </style>
 </head>
 <body>
@@ -31,6 +45,7 @@
     <button id="btn-sat" class="ctrl-btn">Satellite</button>
     <button id="btn-overlay" class="ctrl-btn active">Overlay</button>
     <button id="btn-ruler" class="ctrl-btn">Ruler</button>
+    <button id="btn-compass" class="ctrl-btn">Compass<span class="compass-arrow"></span></button>
   </div>
 </div>
 
@@ -238,6 +253,90 @@ map.on('mousemove', (e) => {
   const a = markerA.getLngLat();
   updateRulerLine(a, e.lngLat);
   showRulerDistance(a, e.lngLat);
+});
+
+// ── Compass mode ───────────────────────────────────────────────────────────
+const btnCompass = document.getElementById('btn-compass');
+const compassArrow = btnCompass.querySelector('.compass-arrow');
+let compassActive = false;
+let smoothedHeading = 0;
+let compassEventName = null;   // 'deviceorientationabsolute' | 'deviceorientation'
+let compassListener = null;
+
+function shortestAngleDelta(from, to) {
+  return ((((to - from) % 360) + 540) % 360) - 180;
+}
+
+function extractHeading(event) {
+  if (typeof event.webkitCompassHeading === 'number') {
+    return event.webkitCompassHeading;   // iOS Safari: already true-north-referenced
+  }
+  if (typeof event.alpha === 'number') {
+    const screenAngle = (screen.orientation && screen.orientation.angle) || window.orientation || 0;
+    return (360 - event.alpha - screenAngle + 360) % 360;
+  }
+  return null;
+}
+
+function onDeviceOrientation(event) {
+  const heading = extractHeading(event);
+  if (heading === null) return;
+  smoothedHeading = (smoothedHeading + shortestAngleDelta(smoothedHeading, heading) * 0.15 + 360) % 360;
+  map.setBearing(smoothedHeading);
+  compassArrow.style.transform = `rotate(${smoothedHeading}deg)`;
+}
+
+async function enableCompassMode() {
+  if (typeof window.DeviceOrientationEvent === 'undefined') {
+    console.warn('[compass] DeviceOrientationEvent not supported on this browser/context');
+    return false;
+  }
+  if (typeof window.DeviceOrientationEvent.requestPermission === 'function') {
+    let result;
+    try {
+      result = await window.DeviceOrientationEvent.requestPermission();
+    } catch (err) {
+      console.warn('[compass] permission request failed:', err);
+      return false;
+    }
+    if (result !== 'granted') {
+      console.warn('[compass] permission denied by user');
+      return false;
+    }
+  }
+
+  compassEventName = 'ondeviceorientationabsolute' in window ? 'deviceorientationabsolute' : 'deviceorientation';
+  compassListener = onDeviceOrientation;
+  window.addEventListener(compassEventName, compassListener);
+  map.dragRotate.disable();
+  map.touchZoomRotate.disableRotation();
+  return true;
+}
+
+function disableCompassMode() {
+  if (compassListener) {
+    window.removeEventListener(compassEventName, compassListener);
+    compassListener = null;
+    compassEventName = null;
+  }
+  map.dragRotate.enable();
+  map.touchZoomRotate.enableRotation();
+  map.easeTo({ bearing: 0, pitch: 0, duration: 300 });
+  compassArrow.style.transform = 'rotate(0deg)';
+}
+
+btnCompass.addEventListener('click', async () => {
+  if (!compassActive) {
+    const ok = await enableCompassMode();
+    if (!ok) return;
+    compassActive = true;
+    smoothedHeading = map.getBearing();   // seed from current bearing, avoid a visible jump
+    btnCompass.classList.add('active');
+  } else {
+    disableCompassMode();
+    compassActive = false;
+    btnCompass.classList.remove('active');
+  }
 });
 
 // ── Overlay tile refresh ───────────────────────────────────────────────────
