@@ -30,6 +30,7 @@
     <button id="btn-osm" class="ctrl-btn active">OSM</button>
     <button id="btn-sat" class="ctrl-btn">Satellite</button>
     <button id="btn-overlay" class="ctrl-btn active">Overlay</button>
+    <button id="btn-ruler" class="ctrl-btn">Ruler</button>
   </div>
 </div>
 
@@ -117,6 +118,7 @@ const depthPopup = new maplibregl.Popup({ closeButton: true, maxWidth: '220px' }
 let depthRequestId = 0;
 
 map.on('click', async (e) => {
+  if (rulerActive) return;
   const requestId = ++depthRequestId;
   const { lng, lat } = e.lngLat;
 
@@ -162,6 +164,82 @@ function setBaseLayer(id) {
 btnOsm.addEventListener('click', () => setBaseLayer('osm'));
 btnSat.addEventListener('click', () => setBaseLayer('sat'));
 
+// ── Ruler ──────────────────────────────────────────────────────────────────
+function haversineMeters(lat1, lon1, lat2, lon2) {
+  const R = 6371000;
+  const toRad = (deg) => deg * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const s = Math.sin(dLat / 2) ** 2 +
+            Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(s));
+}
+
+function formatDistance(meters) {
+  return meters < 1000 ? `${Math.round(meters)} m` : `${(meters / 1000).toFixed(2)} km`;
+}
+
+const btnRuler = document.getElementById('btn-ruler');
+const rulerPopup = new maplibregl.Popup({ closeButton: false, closeOnClick: false });
+let rulerActive = false;
+let markerA = null;
+let markerB = null;
+
+function resetRuler() {
+  if (markerA) { markerA.remove(); markerA = null; }
+  if (markerB) { markerB.remove(); markerB = null; }
+  rulerPopup.remove();
+  map.getSource('ruler-line')?.setData({ type: 'FeatureCollection', features: [] });
+}
+
+function updateRulerLine(a, b) {
+  map.getSource('ruler-line')?.setData({
+    type: 'FeatureCollection',
+    features: [{
+      type: 'Feature',
+      geometry: { type: 'LineString', coordinates: [[a.lng, a.lat], [b.lng, b.lat]] },
+      properties: {},
+    }],
+  });
+}
+
+function showRulerDistance(a, b) {
+  const meters = haversineMeters(a.lat, a.lng, b.lat, b.lng);
+  const mid = [(a.lng + b.lng) / 2, (a.lat + b.lat) / 2];
+  rulerPopup.setLngLat(mid)
+    .setHTML(`<div class="depth-popup">${formatDistance(meters)}</div>`)
+    .addTo(map);
+}
+
+btnRuler.addEventListener('click', () => {
+  rulerActive = !rulerActive;
+  btnRuler.classList.toggle('active', rulerActive);
+  map.getCanvas().style.cursor = rulerActive ? 'crosshair' : '';
+  resetRuler();
+});
+
+map.on('click', (e) => {
+  if (!rulerActive) return;
+  if (markerA && markerB) resetRuler();   // 3rd click starts a new measurement
+
+  if (!markerA) {
+    markerA = new maplibregl.Marker().setLngLat(e.lngLat).addTo(map);
+    return;
+  }
+  markerB = new maplibregl.Marker().setLngLat(e.lngLat).addTo(map);
+  const a = markerA.getLngLat();
+  const b = markerB.getLngLat();
+  updateRulerLine(a, b);
+  showRulerDistance(a, b);
+});
+
+map.on('mousemove', (e) => {
+  if (!rulerActive || !markerA || markerB) return;
+  const a = markerA.getLngLat();
+  updateRulerLine(a, e.lngLat);
+  showRulerDistance(a, e.lngLat);
+});
+
 // ── Overlay tile refresh ───────────────────────────────────────────────────
 let currentProfileKey = 'init';
 
@@ -192,6 +270,14 @@ async function fetchWaterLevel() {
 
 // ── Boot ───────────────────────────────────────────────────────────────────
 map.on('load', () => {
+  map.addSource('ruler-line', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+  map.addLayer({
+    id: 'ruler-line-layer',
+    type: 'line',
+    source: 'ruler-line',
+    paint: { 'line-color': '#38bdf8', 'line-width': 2, 'line-dasharray': [2, 2] },
+  });
+
   fetchWaterLevel();
   setInterval(fetchWaterLevel, POLL_MS);
   geolocate.trigger();

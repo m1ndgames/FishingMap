@@ -8,3 +8,4 @@ services:
     environment:
       - FLASK_DEBUG=0
       - LOG_LEVEL=INFO
+    restart: unless-stopped
